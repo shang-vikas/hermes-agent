@@ -10820,9 +10820,6 @@ class AIAgent:
                         provider=function_args.get("provider"),
             model=function_args.get("model"),
             reasoning_effort=function_args.get("reasoning_effort"),
-            provider=function_args.get("provider"),
-            model=function_args.get("model"),
-            reasoning_effort=function_args.get("reasoning_effort"),
             role=function_args.get("role"),
             parent_agent=self,
         )
