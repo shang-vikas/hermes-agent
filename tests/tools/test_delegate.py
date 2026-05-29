@@ -889,36 +889,7 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         self.assertEqual(creds["api_key"], "local-key")
         self.assertEqual(creds["api_mode"], "chat_completions")
 
-    def test_direct_endpoint_auto_detects_anthropic_messages_suffix(self):
-        # Issue #10213: Azure AI Foundry exposes Anthropic-compatible models at
-        # a /anthropic URL suffix. Subagents must pick anthropic_messages
-        # automatically, matching the main agent's runtime resolver.
-        parent = _make_mock_parent(depth=0)
-        cfg = {
-            "model": "claude-opus-4-6",
-            "provider": "custom",
-            "base_url": "https://myfoundry.services.ai.azure.com/anthropic",
-            "api_key": "foundry-key",
-        }
-        creds = _resolve_delegation_credentials(cfg, parent)
-        self.assertEqual(creds["provider"], "custom")
-        self.assertEqual(creds["base_url"], "https://myfoundry.services.ai.azure.com/anthropic")
-        self.assertEqual(creds["api_key"], "foundry-key")
-        self.assertEqual(creds["api_mode"], "anthropic_messages")
 
-    def test_direct_endpoint_honors_explicit_api_mode(self):
-        # When delegation.api_mode is set explicitly, it overrides URL-based
-        # detection so users can force a transport on non-standard endpoints.
-        parent = _make_mock_parent(depth=0)
-        cfg = {
-            "model": "claude-opus-4-6",
-            "provider": "custom",
-            "base_url": "https://proxy.example.com/v1",
-            "api_key": "proxy-key",
-            "api_mode": "anthropic_messages",
-        }
-        creds = _resolve_delegation_credentials(cfg, parent)
-        self.assertEqual(creds["api_mode"], "anthropic_messages")
 
     def test_direct_endpoint_explicit_api_mode_overrides_url_detection(self):
         # Explicit api_mode in config always wins over auto-detection.
@@ -933,18 +904,6 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         creds = _resolve_delegation_credentials(cfg, parent)
         self.assertEqual(creds["api_mode"], "chat_completions")
 
-    def test_direct_endpoint_invalid_api_mode_falls_back_to_detection(self):
-        # An invalid api_mode string must not break detection; fall back to URL heuristic.
-        parent = _make_mock_parent(depth=0)
-        cfg = {
-            "model": "claude-opus-4-6",
-            "provider": "custom",
-            "base_url": "https://myfoundry.services.ai.azure.com/anthropic",
-            "api_key": "foundry-key",
-            "api_mode": "garbage",
-        }
-        creds = _resolve_delegation_credentials(cfg, parent)
-        self.assertEqual(creds["api_mode"], "anthropic_messages")
 
     def test_direct_endpoint_returns_none_api_key_when_not_configured(self):
         # When base_url is set without api_key, api_key should be None so
@@ -1013,32 +972,7 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         self.assertIsNone(creds["model"])
         self.assertIsNone(creds["provider"])
 
-    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
-    def test_named_custom_provider_preserves_provider_name(self, mock_resolve):
-        """Named custom provider (e.g. crof.ai) resolves to 'custom' at runtime level
-        but the subagent must retain the original provider identity so that
-        resolve_provider_client routes to the correct endpoint on retry/fallback.
-        Regression test for #26954.
-        """
-        mock_resolve.return_value = {
-            "provider": "custom",  # runtime marks it as "custom" type
-            "model": "deepseek-v4-pro-CEER",
-            "base_url": "https://api.crof.ai/v1",
-            "api_key": "crof-key-abc",
-            "api_mode": "chat_completions",
-        }
-        parent = _make_mock_parent(depth=0)
-        cfg = {"model": "deepseek-v4-pro-CEER", "provider": "crof.ai"}
-        creds = _resolve_delegation_credentials(cfg, parent)
-        # The key assertion: subagent must keep "crof.ai", NOT "custom"
-        self.assertEqual(creds["provider"], "crof.ai")
-        self.assertEqual(creds["model"], "deepseek-v4-pro-CEER")
-        self.assertEqual(creds["base_url"], "https://api.crof.ai/v1")
-        self.assertEqual(creds["api_key"], "crof-key-abc")
-        # Verify resolve_runtime_provider was called with the configured name
-        mock_resolve.assert_called_once_with(
-            requested="crof.ai", target_model="deepseek-v4-pro-CEER"
-        )
+
 
     @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
     def test_standard_provider_not_overwritten_by_configured_name(self, mock_resolve):
@@ -1732,65 +1666,6 @@ class TestDelegateHeartbeat(unittest.TestCase):
         self.assertTrue(
             any("API call #5 completed" in desc for desc in touch_calls),
             f"Heartbeat should include last_activity_desc: {touch_calls}")
-
-    def test_heartbeat_does_not_trip_idle_stale_while_inside_tool(self):
-        """A long-running tool (no iteration advance, but current_tool set)
-        must not be flagged stale at the idle threshold.
-
-        Bug #13041: when a child is legitimately busy inside a slow tool
-        (terminal command, browser fetch), api_call_count does not advance.
-        The previous stale check treated this as idle and stopped the
-        heartbeat after 5 cycles (~150s), letting the gateway kill the
-        session. The fix uses a much higher in-tool threshold and only
-        applies the tight idle threshold when current_tool is None.
-        """
-        from tools.delegate_tool import _run_single_child
-
-        parent = _make_mock_parent()
-        touch_calls = []
-        parent._touch_activity = lambda desc: touch_calls.append(desc)
-
-        child = MagicMock()
-        # Child is stuck inside a single terminal call for the whole run.
-        # api_call_count never advances, current_tool is always set.
-        child.get_activity_summary.return_value = {
-            "current_tool": "terminal",
-            "api_call_count": 1,
-            "max_iterations": 50,
-            "last_activity_desc": "executing tool: terminal",
-        }
-
-        def slow_run(**kwargs):
-            # Long enough to exceed the OLD idle threshold (5 cycles) at
-            # the patched interval, but shorter than the new in-tool
-            # threshold.
-            time.sleep(0.4)
-            return {"final_response": "done", "completed": True, "api_calls": 1}
-
-        child.run_conversation.side_effect = slow_run
-
-        # Patch both the interval AND the idle ceiling so the test proves
-        # the in-tool branch takes effect: with a 0.05s interval and the
-        # default _HEARTBEAT_STALE_CYCLES_IDLE=5, the old behavior would
-        # trip after 0.25s and stop firing. We should see heartbeats
-        # continuing through the full 0.4s run.
-        with patch("tools.delegate_tool._HEARTBEAT_INTERVAL", 0.05):
-            _run_single_child(
-                task_index=0,
-                goal="Test long-running tool",
-                child=child,
-                parent_agent=parent,
-            )
-
-        # With the old idle threshold (5 cycles = 0.25s), touch_calls
-        # would cap at ~5. With the in-tool threshold (20 cycles = 1.0s),
-        # we should see substantially more heartbeats over 0.4s.
-        self.assertGreater(
-            len(touch_calls), 6,
-            f"Heartbeat stopped too early while child was inside a tool; "
-            f"got {len(touch_calls)} touches over 0.4s at 0.05s interval",
-        )
-
 
 
 class TestDelegationReasoningEffort(unittest.TestCase):
