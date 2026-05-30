@@ -758,10 +758,15 @@ def _build_child_progress_callback(
                 short = (
                     (goal_label[:55] + "...") if len(goal_label) > 55 else goal_label
                 )
+                # Get identity kwargs which include model from closure
+                identity_kw = _identity_kwargs()
+                model_str = identity_kw.get("model")
+                model_label = f" [model: {model_str}]" if model_str else ""
                 try:
-                    spinner.print_above(f" {prefix}├─ 🔀 {short}")
+                    spinner.print_above(f" {prefix}├─ 🔀 {short}{model_label}")
                 except Exception as e:
                     logger.debug("Spinner print_above failed: %s", e)
+
             _relay("subagent.start", preview=preview or goal_label or "", **kwargs)
             return
 
@@ -1505,7 +1510,12 @@ def _run_single_child(
     try:
         if child_progress_cb:
             try:
-                child_progress_cb("subagent.start", preview=goal)
+                child_model = getattr(child, "model", None)
+                child_progress_cb(
+                    "subagent.start", 
+                    preview=goal,
+                    model=child_model if isinstance(child_model, str) else None
+                )
             except Exception as e:
                 logger.debug("Progress callback start failed: %s", e)
 
@@ -1688,11 +1698,49 @@ def _run_single_child(
             status = "interrupted"
         elif summary:
             # A summary means the subagent produced usable output.
-            # exit_reason ("completed" vs "max_iterations") already
-            # tells the parent *how* the task ended.
             status = "completed"
         else:
             status = "failed"
+
+        # ── Delegation strike tracking ──────────────────────────────────
+        try:
+            _child_model_id = getattr(child, "model", None) or ""
+            if status in ("failed", "timeout"):
+                from agent.delegation_strikes import record_strike, _get_threshold
+                from agent.task_classifier import estimate_task_vector
+                _strike_vec = estimate_task_vector(
+                    goal=goal or "",
+                    context="",
+                    toolsets=[],
+                )
+                _cnt, _deg = record_strike(
+                    model_id=_child_model_id,
+                    task_type="",
+                    task_vector=_strike_vec,
+                )
+                if _deg:
+                    from agent.delegation_strikes import _infer_dominant_task_type
+                    logger.warning(
+                        "Model %s DEGRADED for %s (strike %d/%d) — "
+                        "will escalate next delegation",
+                        _child_model_id,
+                        _infer_dominant_task_type(_strike_vec),
+                        _cnt,
+                        _get_threshold(),
+                    )
+            elif status == "completed":
+                from agent.delegation_strikes import clear_strikes, _infer_dominant_task_type
+                from agent.task_classifier import estimate_task_vector
+                _success_vec = estimate_task_vector(
+                    goal=goal or "",
+                    context="",
+                    toolsets=[],
+                )
+                _success_type = _infer_dominant_task_type(_success_vec)
+                clear_strikes(model_id=_child_model_id, task_type=_success_type)
+        except Exception:
+            logger.debug("Strike tracking failed", exc_info=True)
+        # ─────────────────────────────────────────────────────────────────
 
         # Build tool trace from conversation messages (already in memory).
         # Uses tool_call_id to correctly pair parallel tool calls with results.
@@ -2060,6 +2108,26 @@ def delegate_task(
     except ValueError as exc:
         return tool_error(str(exc))
 
+    # Early model visibility: emit model name BEFORE any child agents are built
+    # or run, so the user sees the model immediately on delegation start — not
+    # only after the subagent completes (which is what the progress callback
+    # in _build_child_progress_callback / _run_single_child does).
+    # Only fires for Discord; CLI already shows model via spinner.
+    try:
+        _delegate_pltfrm = getattr(parent_agent, "platform", None)
+        if _delegate_pltfrm == "discord":
+            _resolved_model = creds.get("model") or model or getattr(parent_agent, "model", "") or ""
+            _goal_for_early_msg = goal or "batch"
+            _short_goal = (_goal_for_early_msg[:80] + "...") if len(_goal_for_early_msg) > 80 else _goal_for_early_msg
+            if _resolved_model:
+                from tools.send_message_tool import send_message_tool
+                send_message_tool({
+                    "message": f"🚀 **Delegating** — Model: `{_resolved_model}` • {_short_goal}",
+                    "target": "discord",
+                })
+    except Exception:
+        logger.debug("Early model visibility emit failed", exc_info=True)
+
     # Normalize to task list
     max_children = _get_max_concurrent_children()
     recovered_tasks, tasks_error = _recover_tasks_from_json_string(tasks)
@@ -2096,6 +2164,90 @@ def delegate_task(
             )
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
+
+    # ── Task-based model matching ──────────────────────────────────────
+    # Override creds.model with task-matched model only when NO model
+    # was resolved via delegation config OR explicit tool args.
+    #
+    # First: check for {model:<name_or_tier>} tag in goal/context (explicit mention)
+    try:
+        from agent.model_mention import extract_model_mention
+        _mentioned_model = extract_model_mention(goal=goal or "", context=context or "")
+        if _mentioned_model:
+            creds["model"] = _mentioned_model
+            effective_model_for_cb = _mentioned_model
+            logger.info(
+                "Model mention override: goal mentions %s → %s  (goal=%s)",
+                _mentioned_model, (goal or "")[:80], (context or "")[:40],
+            )
+            # Skip the entire expensive pipeline — mention is a hard override
+    except Exception:
+        logger.debug("Model mention extraction failed", exc_info=True)
+
+    # Only run the expensive BenchLM + classifier pipeline if NO model
+    # was resolved by ANY of: tool arg, config, model mention tag.
+    try:
+        _resolved_by_config = bool(creds.get("model"))
+        if not provider and not model and not _resolved_by_config:
+            from agent.task_classifier import estimate_task_vector, match_model
+            from agent.capability_source import pull_benchlm_data, get_all_available_vectors
+            from agent.delegation_strikes import filter_degraded, _infer_dominant_task_type
+            
+            _benchlm_data = pull_benchlm_data()
+            _cap_vectors = get_all_available_vectors(_benchlm_data)
+            
+            # Compute task vector FIRST so we can filter degraded models
+            _task_vec = estimate_task_vector(
+                goal=goal,
+                context=context,
+                toolsets=toolsets,
+            )
+            
+            # Build available models
+            _available = [
+                {
+                    "id": mid,
+                    "capability_vector": vec.to_dict(),
+                    "input_price": vec.input_price,
+                    "output_price": vec.output_price,
+                }
+                for mid, vec in _cap_vectors.items()
+            ]
+            
+            # Filter out degraded models for this task type
+            _dominant = _infer_dominant_task_type(_task_vec)
+            _filtered_ids = filter_degraded(
+                [m["id"] for m in _available],
+                _task_vec,
+            )
+            _available = [m for m in _available if m["id"] in _filtered_ids]
+            
+            if not _available:
+                logger.warning(
+                    "All models degraded for %s — using full pool",
+                    _dominant,
+                )
+                _available = [
+                    {
+                        "id": mid,
+                        "capability_vector": vec.to_dict(),
+                        "input_price": vec.input_price,
+                        "output_price": vec.output_price,
+                    }
+                    for mid, vec in _cap_vectors.items()
+                ]
+            
+            _matched_model = match_model(_task_vec, _available)
+            if _matched_model:
+                logger.info(
+                    "Task-based model match: %s (task_vec=%s, dominant=%s)",
+                    _matched_model, _task_vec, _dominant,
+                )
+                creds["model"] = _matched_model
+                effective_model_for_cb = _matched_model
+    except Exception:
+        logger.debug("Task-based model matching failed", exc_info=True)
+    # ────────────────────────────────────────────────────────────────────
 
     overall_start = time.monotonic()
     results = []
