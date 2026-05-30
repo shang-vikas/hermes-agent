@@ -368,15 +368,14 @@ def _keyword_classify(
 
 
 # =====================================================================
-# LAYER 2: LLM booster (ministral-3:14b)
+# LAYER 2: LLM classifier (ministral-3:14b) with self-reported confidence
 # =====================================================================
 
-# LLM booster is only called when keyword confidence < MIN_CONFIDENCE
-# Uses a cheap model: ministral-3:14b
-# Expected cost: ~20 tokens/ticket
-# Only invoked for ~30% of tickets
+# In the ensemble, both keyword and LLM classifiers run in parallel.
+# Their outputs are confidence-weighted and merged.
 
-_LLM_CLASSIFICATION_PROMPT = """Respond with exactly ONE word: coding, reasoning, or knowledge.
+_LLM_CLASSIFICATION_PROMPT = """Respond with this exact JSON format:
+{{"label": "coding|reasoning|knowledge", "confidence": 0.0-1.0}}
 
 coding = implement, fix bugs, write tests, refactor, deploy, optimize, write code
 reasoning = design architecture, analyze trade-offs, plan, evaluate, make decisions
@@ -384,7 +383,7 @@ knowledge = research, find information, learn, document, summarize, check status
 
 Goal: {goal}
 
-ONE WORD ONLY: coding, reasoning, or knowledge"""
+JSON:"""
 
 # Provider + model for the LLM booster
 _LLM_BOOSTER_PROVIDER = "ollama-cloud"
@@ -395,44 +394,85 @@ def _llm_classify(
     goal: str,
     context: str,
     toolsets: Optional[List[str]] = None,
-) -> Dict[str, float]:
-    """Layer 2: LLM-based classification for low-confidence cases.
+) -> Tuple[Dict[str, float], float]:
+    """LLM classifier that returns (vector, confidence).
 
     Calls ministral-3:14b via auxiliary_client.call_llm.
-    Returns a 3-dim vector with the LLM's classification.
+    Returns a 3-dim vector + overall confidence score (0-1).
     Falls back to heuristic pattern matching if LLM call fails.
     """
     try:
         from agent.auxiliary_client import call_llm
+        import json
 
         prompt = _LLM_CLASSIFICATION_PROMPT.format(
             goal=goal or "(empty)",
         )
+
         response = call_llm(
             provider=_LLM_BOOSTER_PROVIDER,
             model=_LLM_BOOSTER_MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0,
-            max_tokens=10,
+            max_tokens=120,
             timeout=10.0,
         )
-        label = response.choices[0].message.content.strip().lower()
-        # Strip markdown formatting and extract first valid label
-        import re
-        m = re.search(r"\b(coding|reasoning|knowledge)\b", label)
-        label = m.group(1) if m else label.strip("*_`.").strip()
+        text = response.choices[0].message.content.strip()
+        # Strip markdown code blocks
+        text = re.sub(r'```(?:json)?\s*|\s*```', '', text).strip()
+        llm_confidence = 0.5
+        label = "knowledge"
+
+        # Extract JSON via brace-depth matching (handles nested braces)
+        def _extract_first_json(txt):
+            i = 0
+            while i < len(txt):
+                if txt[i] == '{':
+                    depth = 0
+                    start = i
+                    while i < len(txt):
+                        if txt[i] == '{': depth += 1
+                        elif txt[i] == '}':
+                            depth -= 1
+                            if depth == 0:
+                                try:
+                                    return json.loads(txt[start:i+1])
+                                except json.JSONDecodeError:
+                                    return None
+                        i += 1
+                else:
+                    i += 1
+            return None
+
+        data = _extract_first_json(text)
+        if data and isinstance(data, dict) and "label" in data:
+            # Handle compound labels like "knowledge|coding", "knowledge, coding"
+            label_raw = str(data["label"]).lower().strip("*_`.,;:| ")
+            for sep in ("|", ",", "/", " "):
+                for part in label_raw.split(sep):
+                    part = part.strip()
+                    if part in ("coding", "reasoning", "knowledge"):
+                        label = part
+                        break
+                if label != "knowledge":
+                    break
+            llm_confidence = float(data.get("confidence", llm_confidence))
+            llm_confidence = max(0.0, min(1.0, llm_confidence))
+        else:
+            # Fallback: just find the keyword in raw text
+            fallback = re.search(r'\b(coding|reasoning|knowledge)\b', text)
+            if fallback:
+                label = fallback.group(1)
 
         vec = {"coding": 0.0, "reasoning": 0.0, "knowledge": 0.0}
         if label == "coding":
-            vec["coding"] = 1.0
+            vec["coding"] = llm_confidence
         elif label == "reasoning":
-            vec["reasoning"] = 1.0
+            vec["reasoning"] = llm_confidence
         elif label == "knowledge":
-            vec["knowledge"] = 1.0
-        else:
-            # Unexpected response — fall through to heuristic
-            logger.warning("LLM booster returned unexpected label: %s", label)
-        return vec
+            vec["knowledge"] = llm_confidence
+
+        return vec, llm_confidence
 
     except Exception as exc:
         logger.debug("LLM booster call failed: %s — using heuristic fallback", exc)
@@ -447,13 +487,12 @@ def _llm_classify(
     if "?" in goal or "?" in context:
         vec["knowledge"] += 0.3
 
-    # Imperative verbs mapping
+    # Imperative verbs
     imperative_coding = {"fix", "implement", "build", "add", "remove", "update", "install"}
     imperative_knowledge = {"find", "search", "check", "verify", "read", "learn", "study"}
     imperative_reasoning = {"design", "plan", "compare", "evaluate", "investigate", "explore"}
 
     words = set(combined.split())
-
     for w in words & imperative_coding:
         vec["coding"] += 0.12
     for w in words & imperative_knowledge:
@@ -461,31 +500,29 @@ def _llm_classify(
     for w in words & imperative_reasoning:
         vec["reasoning"] += 0.12
 
-    # ── Bigram patterns (fallback heuristic) ──
-    bigram_coding = {"pull request", "merge request", "code review", "unit test",
-                     "integration test", "memory leak", "compile error",
-                     "type hints", "test failures", "test coverage",
-                     "fix test", "pipeline", "data in test",
-                     "classifier scoring", "model mapping"}
-    bigram_reasoning = {"should we", "how should", "what if", "what approach",
-                        "best way", "trade off", "decision record",
-                        "compare approaches", "evaluate options",
-                        "design proposal", "architecture review",
-                        "technical design", "design spike",
-                        "design doc", "feasibility"}
-    bigram_knowledge = {"how does it work", "what is a",
-                        "where can i find", "documentation for",
-                        "tell me about", "read about", "look up",
-                        "understand how", "check if it exists"}
+    # Bigram patterns
+    bigram_coding = {"unit test", "test failures", "test coverage", "fix test",
+                     "pipeline", "classifier scoring", "model mapping"}
+    bigram_reasoning = {"should we", "what if", "what approach", "best way",
+                        "trade off", "decision record", "design proposal",
+                        "architecture review", "design doc", "feasibility"}
+    bigram_knowledge = {"how does it work", "what is a", "where can i find",
+                        "documentation for", "tell me about", "read about",
+                        "look up", "understand how", "check if it exists"}
 
-    for cat, vec_key, bk in [("coding", "coding", bigram_coding),
-                              ("reasoning", "reasoning", bigram_reasoning),
-                              ("knowledge", "knowledge", bigram_knowledge)]:
+    for vec_key, bk in [("coding", bigram_coding), ("reasoning", bigram_reasoning),
+                        ("knowledge", bigram_knowledge)]:
         for bg in bk:
             if bg in combined:
                 vec[vec_key] += 0.15
 
-    return vec
+    # Normalize heuristic
+    max_v = max(vec.values()) or 0.01
+    for k in vec:
+        vec[k] = round(vec[k] / max_v, 2)
+
+    fallback_confidence = max(vec.values()) * 0.5
+    return vec, fallback_confidence
 
 
 # =====================================================================
@@ -503,38 +540,101 @@ def estimate_task_vector(
     Returns dict with keys: coding, reasoning, knowledge
     Each value is 0-1 (higher = stronger signal for that dimension).
 
-    Uses 3-layer hybrid:
-      Layer 1 — Expanded keyword classifier (fast path, ~85%)
-      Layer 2 — LLM booster (only when confidence < MIN_CONFIDENCE)
-      Layer 3 — Toolset + file-ref overlay (always on)
+    Hybrid ensemble architecture:
+      ┌─────────────┐    ┌──────────────┐
+      │ Keyword      │    │ LLM          │  (BOTH run in parallel)
+      │ Classifier   │    │ Classifier   │
+      │ (SDLC keys)  │    │ (ministral)  │
+      └──────┬──────┘    └──────┬───────┘
+             │                  │
+             ▼                  ▼
+      ┌──────────────────────────────────────┐
+      │  Weighted Ensemble Fuser              │
+      │  w_k = kw_confidence                 │
+      │  w_l = max(llm_confidence, 0.3)      │
+      │  final = w_k*kw + w_l*llm / (w_k+w_l)│
+      └──────────────────────────────────────┘
+                      │
+                      ▼
+      ┌──────────────────────────────────────┐
+      │  Toolset + File-path Overlay         │
+      └──────────────────────────────────────┘
+                      │
+                      ▼
+              Normalized [0, 1]
     """
-    # Layer 1 + 3 combined
-    vec, confidence = _keyword_classify(goal, context, toolsets)
+    # Layer 1: Keyword classifier
+    kw_vec, kw_confidence = _keyword_classify(goal, context, toolsets)
     logger.debug(
-        "Keyword: coding=%.2f reasoning=%.2f knowledge=%.2f conf=%.2f",
-        vec["coding"], vec["reasoning"], vec["knowledge"], confidence,
+        "Keyword: c=%.2f r=%.2f k=%.2f conf=%.2f",
+        kw_vec["coding"], kw_vec["reasoning"], kw_vec["knowledge"], kw_confidence,
     )
 
-    # Layer 2: Boost with LLM only when keyword signals are genuinely low
-    need_boost = confidence < MIN_CONFIDENCE and max(vec.values()) > 0.01
-    if need_boost:
-        llm_vec = _llm_classify(goal, context, toolsets)
+    # Layer 2: LLM classifier (always run for non-empty goals — ensemble needs both scores)
+    if goal and goal.strip():
+        llm_vec, llm_confidence = _llm_classify(goal, context, toolsets)
         logger.debug(
-            "LLM booster: coding=%.2f reasoning=%.2f knowledge=%.2f",
-            llm_vec["coding"], llm_vec["reasoning"], llm_vec["knowledge"],
+            "LLM: c=%.2f r=%.2f k=%.2f conf=%.2f",
+            llm_vec["coding"], llm_vec["reasoning"], llm_vec["knowledge"], llm_confidence,
         )
-        # LLM is a tiebreaker: boost keyword-agreeing cases, gently nudge disagreeing
-        keyword_primary = max(vec.items(), key=lambda x: x[1])[0]
-        if llm_vec.get(keyword_primary, 0) > 0:
-            # LLM agrees with keyword result — reinforce (+0.1)
-            vec[keyword_primary] += 0.10
-        else:
-            # LLM disagrees — nudge if keyword signal is weak (gap < 50%)
-            values = sorted(vec.values(), reverse=True)
-            if len(values) >= 2 and values[0] > 0 and (values[0] - values[1]) / max(values[0], 0.01) < 0.50:
-                llm_primary = max(llm_vec.items(), key=lambda x: x[1])[0]
-                if llm_vec[llm_primary] > 0:
-                    vec[llm_primary] += 0.08  # Meaningful nudge towards LLM choice
+    else:
+        llm_vec = {"coding": 0.0, "reasoning": 0.0, "knowledge": 0.0}
+        llm_confidence = 0.0
+
+    # Layer 3: Weighted ensemble fuser with sigmoidal weighting
+    # Keyword confidence: [0, 1] — higher = more reliable keyword signal
+    # LLM confidence: [0, 1] — self-reported by ministral
+    #
+    # Weighting strategy (sigmoid blend):
+    #   kw_weight = sigmoid(kw_confidence, midpoint=0.5, slope=4)
+    #     → kw_confidence 0.3→0.27, 0.5→0.5, 0.7→0.73, 0.9→0.91
+    #   llm_weight = sigmoid(llm_confidence, midpoint=0.4, slope=3)
+    #     → llm_confidence 0.3→0.35, 0.5→0.55, 0.7→0.73, 0.9→0.91
+    #   LLM gets a slight edge because it has more semantic understanding
+    #
+    # Contradiction detection:
+    #   If kw and llm pick DIFFERENT primary categories AND
+    #   llm_confidence >= 0.55 (confident disagree) → boost LLM weight 2x
+    #   This prevents high-confidence keywords from overriding clear LLM signals
+
+    def _sigmoid(x, midpoint=0.5, slope=4):
+        return 1.0 / (1.0 + (2.71828 ** (-slope * (x - midpoint))))
+
+    kw_weight = _sigmoid(kw_confidence, midpoint=0.5, slope=4)
+    llm_weight = _sigmoid(llm_confidence, midpoint=0.4, slope=3)
+
+    # Contradiction detection
+    kw_primary = max(kw_vec.items(), key=lambda x: x[1])[0]
+    llm_primary = max(llm_vec.items(), key=lambda x: x[1])[0]
+    if kw_primary != llm_primary and llm_confidence >= 0.55:
+        # LLM confidently disagrees with keywords → boost LLM weight
+        llm_weight *= 2.0
+        logger.debug("Contradiction: kw=%s(%d:%.2f) llm=%s(%d:%.2f) → boosting LLM 2x",
+                     kw_primary, list(kw_vec.values()).index(max(kw_vec.values())), kw_confidence,
+                     llm_primary, 0, llm_confidence)
+
+    total_weight = kw_weight + llm_weight
+    if total_weight > 0:
+        vec = {}
+        for k in kw_vec:
+            vec[k] = (kw_weight * kw_vec[k] + llm_weight * llm_vec[k]) / total_weight
+    else:
+        vec = {"coding": 0.0, "reasoning": 0.0, "knowledge": 0.0}
+
+    # Layer 4: Toolset + file-path overlay (always on)
+    tools = set(t.lower() for t in (toolsets or []))
+    if tools == {"terminal"} or tools == {"terminal", "file"}:
+        vec["coding"] += 0.2
+    if "web_search" in tools and "terminal" not in tools:
+        vec["knowledge"] += 0.3
+    if "browser" in tools and "terminal" not in tools and "web_search" not in tools:
+        vec["knowledge"] += 0.2
+    if "delegation" in tools:
+        vec["reasoning"] += 0.25
+
+    file_count = _has_code_file_refs(context)
+    if file_count > 0:
+        vec["coding"] += min(file_count * 0.05, 0.3)
 
     # ── Normalize to [0, 1] maintaining relative strengths ──
     max_val = max(vec.values()) or 1.0
